@@ -1,0 +1,10 @@
+{
+  "best_params": {
+    "n_estimators": 154,
+    "max_depth": 8,
+    "min_samples_split": 6,
+    "min_samples_leaf": 2
+  },
+  "best_value": 0.8356496842407198,
+  "duration_s": 35.34023356437683
+}
