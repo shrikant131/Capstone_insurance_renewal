@@ -7,7 +7,12 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
-import uvicorn
+# Make uvicorn optional — prevents Streamlit import failure if not installed
+try:
+    import uvicorn
+except ImportError:
+    uvicorn = None
+    print("⚠️ uvicorn not found (safe to ignore if running Streamlit only)")
 from typing import Optional, Dict, Any
 import joblib
 import time
@@ -322,4 +327,8 @@ def main():
                 st.error(f"Prediction failed: {e}")
 
 if __name__ == "__main__":
-    main()
+    # If you are running FastAPI directly (not Streamlit)
+    if uvicorn:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        print("⚠️ uvicorn not installed — skipping FastAPI launch.")
