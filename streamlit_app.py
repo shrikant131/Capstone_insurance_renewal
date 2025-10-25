@@ -1,334 +1,476 @@
+# streamlit_app.py
+# Finalized Streamlit UI for Insurance Renewal Prediction
+# Drop this file into your repo (replace existing streamlit_app.py).
+# Make sure models/model_metadata.json and models/*.joblib are present if you want automatic model selection.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import json
-import os
-from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-# Make uvicorn optional — prevents Streamlit import failure if not installed
-try:
-    import uvicorn
-except ImportError:
-    uvicorn = None
-    print("⚠️ uvicorn not found (safe to ignore if running Streamlit only)")
-from typing import Optional, Dict, Any
 import joblib
-import time
-import logging
-import sys
-from fastapi.responses import JSONResponse
-import threading
-from insrenew import MLContext
+import io
+import plotly.express as px
+import plotly.graph_objects as go
+import shap
+import base64
+from datetime import datetime
+import json
+from pathlib import Path
+import hashlib
+import matplotlib.pyplot as plt
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("app")
-
-# Initialize FastAPI app
-api = FastAPI(title="Insurance Renewal ML Backend")
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Global variables and paths
-BASE_DIR = Path.cwd()
-DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-RESULTS_DIR = BASE_DIR / "results"
-ARTIFACTS_FILE = MODELS_DIR / "artifacts.json"
-FINAL_SUMMARY = RESULTS_DIR / "final_model_selection_summary.json"
-
-# Create necessary directories
-for d in (DATA_DIR, MODELS_DIR, RESULTS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-# Pydantic models for request/response
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-
-class StatusLog(BaseModel):
-    step: str
-    msg: str
-    ts: float
-
-class TrainResponse(BaseModel):
-    status_log: List[StatusLog]
-    trained_models: Dict[str, bool]
-    chosen_model: Optional[str]
-
-class TestResponse(BaseModel):
-    message: str
-    metrics: Dict[str, Any]
-    preview: List[Dict[str, Any]]
-    predictions_path: str
-
-class PredictResponse(BaseModel):
-    prediction: int
-    prob: float
-    model: str
-
-# FastAPI endpoints
-@api.post("/train", response_model=TrainResponse)
-async def train_endpoint(train_data: Dict[str, Any]):
-    """Train models using uploaded data"""
-    status_log = []
-    start_ts = time.time()
-    
+# -----------------------
+# Helper functions (must be defined before use)
+# -----------------------
+@st.cache_data(ttl=3600)
+def load_model(path="models/final_model.joblib"):
     try:
-        # Convert dict to DataFrame
-        df = pd.DataFrame(train_data)
-        
-        # Save training data
-        train_path = DATA_DIR / "train_uploaded.csv"
-        df.to_csv(train_path, index=False)
-        status_log.append(StatusLog(step="upload", msg=f"Saved training file", ts=time.time()))
-        
-        # Initialize ML Context and run pipeline
-        ctx = MLContext(base_dir=str(BASE_DIR))
-        ctx.set_df(df)
-        
-        # Run EDA
-        try:
-            ctx.run_eda()
-            status_log.append({"step": "eda", "msg": "EDA completed", "ts": time.time()})
-        except Exception as e:
-            status_log.append({"step": "eda", "msg": f"EDA failed: {e}", "ts": time.time()})
-        
-        # Feature engineering
-        try:
-            ctx.run_fe()
-            ctx.prepare_feature_config()
-            ctx.build_preprocessor()
-            status_log.append({"step": "fe", "msg": "Feature engineering complete", "ts": time.time()})
-        except Exception as e:
-            status_log.append({"step": "fe", "msg": f"Feature engineering failed: {e}", "ts": time.time()})
-        
-        # Train/test split
-        ctx.split_train_test(test_size=0.2)
-        
-        # Train models
-        trained = {}
-        models_to_train = [
-            ('lr', ctx.train_lr),
-            ('xgb', ctx.train_xgboost),
-            ('nn', ctx.train_neural_net),
-            ('brf', ctx.train_balanced_random_forest),
-            ('eec', ctx.train_easy_ensemble),
-            ('lgb', ctx.train_lightgbm),
-            ('tab', ctx.train_tabnet)
-        ]
-        
-        for model_name, train_func in models_to_train:
-            try:
-                train_func()
-                trained[model_name] = True
-                status_log.append({"step": f"train_{model_name}", "msg": f"{model_name} trained successfully", "ts": time.time()})
-            except Exception as e:
-                status_log.append({"step": f"train_{model_name}", "msg": f"{model_name} training failed: {e}", "ts": time.time()})
-        
-        # Save models and artifacts
-        ctx.prepare_artifacts()
-        saved = ctx.save_models(prefix="trained")
-        artifacts = {
-            'artifacts': {k: str(v) for k, v in saved.items()},
-            'feature_names': ctx.artifacts.get('feature_names', []),
-        }
-        with open(ARTIFACTS_FILE, "w") as f:
-            json.dump(artifacts, f, indent=2, default=str)
-        
-        # Aggregate metrics and save final selection
-        ctx.aggregate_model_comparison_metrics()
-        summary_path = ctx.prepare_final_model_selection_summary()
-        
-        # Get chosen model
-        chosen = None
-        try:
-            with open(FINAL_SUMMARY, "r") as f:
-                final = json.load(f)
-                chosen = final.get("recommendation", {}).get("recommended_model")
-        except Exception:
-            pass
-        
-        return {"status_log": status_log, "trained_models": trained, "chosen_model": chosen}
-    
+        model = joblib.load(path)
     except Exception as e:
-        status_log.append({"step": "error", "msg": str(e)})
-        return {"status_log": status_log, "error": str(e)}
+        st.warning(f"Could not load model at {path}: {e}")
+        model = None
+    return model
 
-@api.post("/test", response_model=TestResponse)
-async def test_endpoint(test_data: Dict[str, Any]):
-    """Run predictions on test data"""
+@st.cache_data
+def load_sample_data(path="data/sample.csv"):
     try:
-        # Convert dict to DataFrame
-        df = pd.DataFrame(test_data)
-        
-        # Save test data
-        test_path = DATA_DIR / "test_uploaded.csv"
-        df.to_csv(test_path, index=False)
-        
-        ctx = MLContext(base_dir=str(BASE_DIR))
-        test_results = ctx.predict_external_test(str(test_path))
-        
-        # Store test data for later use
-        ctx.test_df = df
-        
-        return TestResponse(
-            message=test_results.get("message", ""),
-            metrics=test_results.get("metrics", {}),
-            preview=test_results.get("preview", []),
-            predictions_path=str(test_results.get("output_path", ""))
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+        return pd.read_csv(path)
+    except Exception:
+        # tiny sample fallback
+        return pd.DataFrame({
+            "id": [1,2,3],
+            "age_years": [35,45,60],
+            "income": [40000,70000,30000],
+            "premium": [2000,5000,1500],
+            "Count_3-6_months_late":[0,1,0],
+            "Count_6-12_months_late":[0,0,1],
+            "Count_more_than_12_months_late":[0,0,0],
+            "sourcing_channel":["Agent","Online","Agent"],
+            "residence_area_type":["Urban","Semiurban","Rural"],
+            "renewal":[1,0,1]
+        })
 
-@api.post("/predict", response_model=PredictResponse)
-async def predict_endpoint(customer_data: Dict[str, Any]):
-    """Predict for a single customer"""
-    try:
-        ctx = MLContext(base_dir=str(BASE_DIR))
-        
-        # Align features with training schema
-        feature_path = ctx.results_dir / "feature_names.npy"
-        if feature_path.exists():
-            expected_features = list(np.load(feature_path, allow_pickle=True))
-            for col in expected_features:
-                if col not in customer_data:
-                    customer_data[col] = 0
-            customer_data = {k: customer_data[k] for k in expected_features if k in customer_data}
-        
-        result = ctx.predict_single(customer_dict=customer_data)
-        return PredictResponse(
-            prediction=result.get("prediction", 0),
-            prob=result.get("prob", 0.0),
-            model=result.get("model", "unknown")
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+@st.cache_data
+def fe_transform(df):
+    df = df.copy()
+    # minimal feature engineering for UI demo: create premium_to_income if missing
+    if "premium_to_income" not in df.columns and "premium" in df.columns and "income" in df.columns:
+        df["premium_to_income"] = df["premium"] / (df["income"].replace(0, np.nan))
+    # fill na for demo (in production use the real pipeline)
+    df = df.fillna(-999)
+    return df
 
-# Streamlit UI
-def main():
-    st.set_page_config(page_title="Insurance Renewal ML App", layout="wide")
-    st.title("Insurance Renewal — Training / Testing / Single Prediction")
+def to_download_link(df: pd.DataFrame, filename="predictions.csv"):
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    return f"data:file/csv;base64,{b64}", filename
 
-    # Initialize session state
-    if "train_result" not in st.session_state:
-        st.session_state["train_result"] = None
-    if "test_df" not in st.session_state:
-        st.session_state["test_df"] = None
-    if "chosen_model" not in st.session_state:
-        st.session_state["chosen_model"] = None
+def dataset_fingerprint(df):
+    """Same logic used in Streamlit app"""
+    cols = ",".join(sorted(df.columns.astype(str)))
+    meta = f"{cols}|rows={len(df)}"
+    return hashlib.sha1(meta.encode("utf-8")).hexdigest()[:12]
 
-    # Create tabs
-    tab1, tab2, tab3 = st.tabs(["Train", "Test", "Predict"])
-
-    # Train Tab
-    with tab1:
-        st.header("1) Upload Training CSV and Train Models")
-        train_file = st.file_uploader("Upload training CSV", type=["csv"], key="train_file")
-
-        if st.button("Start Training"):
-            if train_file is None:
-                st.error("Please upload a training CSV first.")
-            else:
-                with st.spinner("Training models... this may take several minutes"):
-                    # Read CSV and call training endpoint
-                    train_data = pd.read_csv(train_file)
-                    # Convert DataFrame to dict for FastAPI
-                    train_dict = train_data.to_dict(orient='list')
-                    result = asyncio.run(train_endpoint(train_dict))
-                    
-                    if "error" in result:
-                        st.error(f"Training failed: {result['error']}")
-                    else:
-                        st.session_state["train_result"] = result
-                        if result.chosen_model:
-                            st.session_state["chosen_model"] = result.chosen_model
-                        st.success("Training completed")
-                        st.write("Status log:")
-                        st.json([log.dict() for log in result.status_log])
-
-        if st.session_state["train_result"]:
-            st.subheader("Last training result")
-            st.write("Chosen model:", st.session_state.get("chosen_model"))
-            st.json(st.session_state["train_result"])
-
-    # Test Tab
-    with tab2:
-        st.header("2) Upload Test CSV and Run Predictions")
-        st.write("Chosen model from training:", st.session_state.get("chosen_model"))
-        test_file = st.file_uploader("Upload test CSV", type=["csv"], key="test_file")
-        model_override = st.text_input("Model override (optional)", value="", key="model_override")
-
-        if st.button("Run Test Predictions"):
-            if test_file is None:
-                st.error("Please upload a test CSV first.")
-            else:
-                with st.spinner("Running predictions..."):
-                    test_data = pd.read_csv(test_file)
-                    # Convert DataFrame to dict for FastAPI
-                    test_dict = test_data.to_dict(orient='list')
-                    result = asyncio.run(test_endpoint(test_dict))
-                    
-                    st.success("Test predictions created")
-                    st.write("Predictions file:", result.predictions_path)
-                    
-                    if result.preview:
-                        st.dataframe(pd.DataFrame(result.preview))
-                    
-                    st.session_state["test_df"] = test_data
-                    st.info("Test data stored for single predictions")
-
-                    # Display metrics
-                    st.write("Model evaluation metrics:")
-                    st.json(result.metrics)
-
-    # Predict Tab
-    with tab3:
-        st.header("3) Single Customer Prediction")
-        st.write("Select an ID from uploaded test data or enter feature values manually")
-
-        test_df = st.session_state.get("test_df")
-        if test_df is not None:
-            st.subheader("Select ID from uploaded test set")
-            if 'id' in test_df.columns:
-                selected_id = st.selectbox("Choose ID", test_df['id'].astype(str).tolist())
-                if st.button("Use selected ID for prediction"):
-                    row = test_df[test_df['id'].astype(str) == selected_id].iloc[0].to_dict()
-                    st.write("Selected row data:")
-                    st.json(row)
-                    
-                    result = asyncio.run(predict_endpoint(row))
-                    st.success(f"Prediction: {result.prediction} (prob={result.prob:.3f}) using model {result.model}")
-
-        st.subheader("Or: Manually enter customer features")
-        st.write("Enter feature values as JSON")
-        cust_text = st.text_area("Customer feature dict", height=200, value='{"age_years": 45, "Income": 42000}')
-        
-        if st.button("Predict for manual customer"):
-            try:
-                cust = json.loads(cust_text)
-                result = asyncio.run(predict_endpoint(cust))
-                st.success(f"Prediction: {result.prediction} (prob={result.prob:.3f}) using model {result.model}")
-            except json.JSONDecodeError as e:
-                st.error(f"Invalid JSON: {e}")
-            except Exception as e:
-                st.error(f"Prediction failed: {e}")
-
-if __name__ == "__main__":
-    # If you are running FastAPI directly (not Streamlit)
-    if uvicorn:
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+def save_model_metadata(
+    model_key: str,
+    model_path: str,
+    model_name: str,
+    version: str,
+    auc: float,
+    accuracy: float,
+    description: str,
+    feature_names: list,
+    df_eval=None,
+    per_dataset_metrics: dict=None,
+    metadata_path="models/model_metadata.json"
+):
+    """
+    Create or update model metadata JSON automatically after training.
+    """
+    path = Path(metadata_path)
+    if path.exists():
+        with open(path, "r") as f:
+            metadata = json.load(f)
     else:
-        print("⚠️ uvicorn not installed — skipping FastAPI launch.")
+        metadata = {}
+
+    # Build per-dataset fingerprint entry if df_eval given
+    per_dataset = {}
+    if df_eval is not None:
+        fp = dataset_fingerprint(df_eval)
+        per_dataset[fp] = {
+            "auc": round(auc, 3),
+            "accuracy": round(accuracy, 3),
+            "notes": "auto-logged from training dataset"
+        }
+
+    # Compose metadata record
+    metadata[model_key] = {
+        "model_name": model_name,
+        "model_version": version,
+        "trained_on": str(date.today()),
+        "auc": round(auc, 3),
+        "accuracy": round(accuracy, 3),
+        "description": description,
+        "path": model_path,
+        "feature_names": feature_names,
+        "per_dataset": per_dataset or per_dataset_metrics or {}
+    }
+
+    # Save back to file
+    Path(metadata_path).parent.mkdir(exist_ok=True, parents=True)
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"✅ Updated {metadata_path} with entry: {model_key}")
+📘 Example usage (inside training notebook)
+After your Optuna tuning or model evaluation:
+
+python
+Copy code
+best_model = xgb_clf
+best_model_path = "models/xgb_v1.3.joblib"
+joblib.dump(best_model, best_model_path)
+
+best_auc = 0.941
+best_acc = 0.939
+feature_names = X_train.columns.tolist()
+
+save_model_metadata(
+    model_key="xgb_v1.3",
+    model_path=best_model_path,
+    model_name="XGBoost Classifier",
+    version="v1.3",
+    auc=best_auc,
+    accuracy=best_acc,
+    description="Best model selected from Optuna tuning across 5 candidates.",
+    feature_names=feature_names,
+    df_eval=X_valid  # optional; used to record dataset fingerprint
+)
+
+# -----------------------
+# Model metadata utilities
+# -----------------------
+def dataset_fingerprint(df):
+    # simple fingerprint: sorted column names + row count
+    cols = ",".join(sorted(df.columns.astype(str)))
+    meta = f"{cols}|rows={len(df)}"
+    return hashlib.sha1(meta.encode("utf-8")).hexdigest()[:12]
+
+@st.cache_data(ttl=3600)
+def load_all_model_metadata(path="models/model_metadata.json"):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        st.warning(f"Failed to load model metadata: {e}")
+        return {}
+
+def choose_best_model_for_df(df, metadata):
+    if not metadata:
+        return None, None
+    fp = dataset_fingerprint(df)
+    # look for per_dataset matches
+    candidates = []
+    for key, meta in metadata.items():
+        per = meta.get("per_dataset", {})
+        if fp in per:
+            candidates.append((key, per[fp].get("auc", meta.get("auc", 0.0)), "per_dataset"))
+    if candidates:
+        best_key, best_auc, _ = max(candidates, key=lambda x: x[1])
+        return best_key, "per_dataset"
+    # fallback: global best by 'auc'
+    candidates = [(key, meta.get("auc", 0.0)) for key, meta in metadata.items()]
+    best_key, _ = max(candidates, key=lambda x: x[1])
+    return best_key, "global"
+
+def render_model_card(meta):
+    if not meta:
+        st.info("No model metadata available.")
+        return
+    model_name = meta.get("model_name", "Unknown model")
+    version = meta.get("model_version", "-")
+    trained_on = meta.get("trained_on", "-")
+    auc = meta.get("auc", None)
+    acc = meta.get("accuracy", None)
+    metric_str = []
+    if auc is not None:
+        metric_str.append(f"AUC = {auc:.3f}")
+    if acc is not None:
+        metric_str.append(f"Accuracy = {acc*100:.1f}%")
+    metric_line = ", ".join(metric_str) if metric_str else meta.get("metric", "-")
+
+    phrasing = (
+        f"🧠 **Active Model:** {model_name} ({version})  \n"
+        f"Selected as best performer ({metric_line}) from automated Optuna tuning across 5 candidate models on the provided dataset."
+    )
+
+    st.markdown(
+        f"""
+        <div style="background:#f2f8fc; padding:12px; border-radius:10px;">
+          <div style="font-weight:700; font-size:15px;">{phrasing}</div>
+          <div style="margin-top:6px; color:#345; font-size:13px;"><i>{meta.get('description','')}</i></div>
+          <div style="margin-top:8px; font-size:12px; color:#555;">Trained: {trained_on}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# -----------------------
+# Page config & styling
+# -----------------------
+st.set_page_config(page_title="Insurance Renewal Predictor", layout="wide", initial_sidebar_state="expanded")
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg, #f7fbff 0%, #ffffff 100%); }
+    .big-title { font-size:28px; font-weight:700; color:#0b4c6a; }
+    .subtitle { color:#2b6777; margin-bottom:12px; }
+    .card { background: white; padding: 16px; border-radius: 10px; box-shadow: 0 2px 8px rgba(14,30,37,0.06); }
+    </style>
+    """, unsafe_allow_html=True
+)
+
+# -----------------------
+# Top header
+# -----------------------
+col1, col2 = st.columns([0.15, 0.85])
+with col1:
+    st.image("assets/logo.png" if st.secrets.get("has_logo", False) else "https://placehold.co/80x80?text=Logo", width=80)
+with col2:
+    st.markdown('<div class="big-title">Insurance Renewal Predictor</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Predict customer renewals & surface who to target for retention campaigns</div>', unsafe_allow_html=True)
+    st.markdown(f"**Model:** `{st.secrets.get('model_version', 'v1.0')}` &nbsp;&middot;&nbsp; **Last updated:** {st.secrets.get('model_updated', datetime.utcnow().isoformat())}")
+
+# -----------------------
+# Sidebar controls
+# -----------------------
+st.sidebar.header("Controls")
+upload = st.sidebar.file_uploader("Upload policy CSV (optional)", type=["csv"])
+sample_mode = st.sidebar.selectbox("Load dataset", ["Sample data", "Upload data"], index=0)
+manual_model_path = st.sidebar.text_input("Manual model path (optional)", value="models/final_model.joblib")
+predict_button = st.sidebar.button("Run Predictions")
+threshold = st.sidebar.slider("Renewal probability threshold", 0.0, 1.0, 0.5, 0.01)
+show_shap = st.sidebar.checkbox("Show SHAP explainability", value=True)
+
+# -----------------------
+# Load data + basic FE
+# -----------------------
+if sample_mode == "Sample data":
+    df_raw = load_sample_data()
+elif upload:
+    try:
+        df_raw = pd.read_csv(upload)
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+        df_raw = load_sample_data()
+else:
+    df_raw = load_sample_data()
+
+df = fe_transform(df_raw)
+
+# -----------------------
+# Model metadata selection (run AFTER df exists)
+# -----------------------
+all_meta = load_all_model_metadata("models/model_metadata.json")
+model_keys = list(all_meta.keys())
+
+best_key = None
+source = None
+if df is not None and model_keys:
+    try:
+        best_key, source = choose_best_model_for_df(df, all_meta)
+    except Exception as e:
+        st.warning(f"Model auto-selection failed: {e}")
+
+# Sidebar selectbox: let user override. If no metadata, allow manual path.
+if model_keys:
+    default_index = model_keys.index(best_key) if (best_key in model_keys) else 0
+    selected_key = st.sidebar.selectbox("Active model (auto-selected or choose)", options=model_keys, index=default_index)
+else:
+    st.sidebar.info("No model metadata found. You can provide a manual model path.")
+    selected_key = None
+
+# determine which model to load: metadata selected or manual path
+selected_meta = all_meta.get(selected_key) if selected_key else None
+render_model_card(selected_meta)
+
+model = None
+if selected_meta and selected_meta.get("path"):
+    model = load_model(selected_meta.get("path"))
+    if model:
+        st.sidebar.success(f"Loaded model: {selected_meta.get('model_name')} ({selected_meta.get('model_version')})")
+    else:
+        st.sidebar.error(f"Failed to load model at {selected_meta.get('path')}.")
+else:
+    # if metadata not present or user wants manual model, try manual path
+    if manual_model_path:
+        try:
+            model = load_model(manual_model_path)
+            if model:
+                st.sidebar.success(f"Loaded model from manual path")
+        except Exception:
+            model = None
+
+# -----------------------
+# KPI cards
+# -----------------------
+pred_col1, pred_col2, pred_col3, pred_col4 = st.columns(4)
+with pred_col1:
+    st.metric("Data rows", f"{len(df):,}")
+with pred_col2:
+    churn_guess = round(df.get("renewal", pd.Series([0]*len(df))).mean() * 100, 2)
+    st.metric("Existing renewal %", f"{churn_guess}%")
+with pred_col3:
+    st.metric("Model loaded", "Yes" if model else "No")
+with pred_col4:
+    st.metric("Threshold", f"{threshold:.2f}")
+
+st.write("")
+
+# -----------------------
+# Tabs: Data / EDA / Predict / Explain / Monitoring
+# -----------------------
+tabs = st.tabs(["Data", "EDA", "Predictions", "Explainability", "Monitoring"])
+
+# ----- Data tab -----
+with tabs[0]:
+    st.subheader("Dataset Preview")
+    st.dataframe(df.head(200), use_container_width=True)
+    st.download_button("Download preview CSV", data=df.head(200).to_csv(index=False).encode('utf-8'), file_name="preview.csv", mime="text/csv")
+
+# ----- EDA tab -----
+with tabs[1]:
+    st.subheader("Exploratory Data Analysis")
+    left, right = st.columns([2,1])
+    with left:
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        if num_cols:
+            col_sel = st.selectbox("Feature for distribution", num_cols, index=0)
+            fig = px.histogram(df, x=col_sel, nbins=40, marginal="box", title=f"Distribution of {col_sel}")
+            st.plotly_chart(fig, use_container_width=True)
+        if len(num_cols) > 1:
+            corr = df[num_cols].corr()
+            fig2 = px.imshow(corr, text_auto=True, title="Correlation matrix")
+            st.plotly_chart(fig2, use_container_width=True)
+    with right:
+        st.markdown("### Cohort & KPIs")
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        if not cat_cols:
+            cat_cols = ["sourcing_channel"] if "sourcing_channel" in df.columns else []
+        if cat_cols:
+            group_col = st.selectbox("Group by (categorical)", cat_cols, index=0)
+            cohort = df.groupby(group_col).agg(total=("id","count"), mean_premium=("premium","mean"))
+            st.dataframe(cohort.reset_index())
+        else:
+            st.info("No categorical columns detected for cohorting.")
+
+# ----- Predictions tab -----
+with tabs[2]:
+    st.subheader("Batch & Single Predictions")
+    if not model:
+        st.warning("Model not loaded. Upload model file or set correct path in sidebar.")
+    # Batch predict button
+    if predict_button and model:
+        with st.spinner("Running model predictions..."):
+            X_cols = [c for c in df.columns if c not in ("id", "renewal")]
+            X = df[X_cols].copy()
+
+            # Validate expected features if provided in metadata
+            expected_features = None
+            if selected_meta:
+                expected_features = selected_meta.get("feature_names")
+            if expected_features:
+                missing = [c for c in expected_features if c not in X.columns]
+                if missing:
+                    st.error(f"Model expects features not present in data: {missing}")
+                    st.stop()
+                # reorder columns
+                X = X[expected_features]
+            else:
+                st.warning("No 'feature_names' in metadata — ensure features match model training set.")
+
+            try:
+                proba = model.predict_proba(X)[:, 1]
+            except Exception:
+                proba = model.predict(X)
+                proba = np.clip(proba, 0, 1)
+
+            df_out = df.copy()
+            df_out["renewal_prob"] = proba
+            df_out["renewal_pred"] = (df_out["renewal_prob"] >= threshold).astype(int)
+
+            st.success("Predictions finished")
+            st.dataframe(df_out.sort_values("renewal_prob", ascending=False).head(50), use_container_width=True)
+
+            to_target = df_out[(df_out["renewal_pred"]==0)].sort_values("premium", ascending=False).head(200)
+            st.markdown(f"**Top {len(to_target)} customers to target** (predicted non-renewals with highest premium)")
+            st.dataframe(to_target[["id","premium","renewal_prob"]].head(50))
+
+            csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+            st.download_button("Download full predictions CSV", data=csv_bytes, file_name="predictions.csv", mime="text/csv")
+
+    # Single-prediction UI
+    st.markdown("---")
+    st.markdown("### Predict for a single customer")
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    first_cols = numeric_cols[:6]
+    if first_cols:
+        cols = st.columns(len(first_cols))
+        single = {}
+        for i, c in enumerate(first_cols):
+            single[c] = cols[i].number_input(c, value=float(df[c].median() if c in df.columns else 0.0))
+        for c in numeric_cols[6:12]:
+            single[c] = st.number_input(c, value=float(df[c].median() if c in df.columns else 0.0))
+        if st.button("Predict single"):
+            x_single = pd.DataFrame([single])
+            x_single = fe_transform(x_single)
+            if model:
+                try:
+                    p = model.predict_proba(x_single)[:,1][0]
+                except Exception:
+                    p = float(model.predict(x_single)[0])
+                st.metric("Renewal probability", f"{p:.3f}")
+                st.info("Action: Add to campaign list" if p < threshold else "Likely to renew — low priority")
+            else:
+                st.warning("Model not loaded. Can't predict.")
+    else:
+        st.info("No numeric columns available for single-prediction UI.")
+
+# ----- Explainability tab -----
+with tabs[3]:
+    st.subheader("Explainability (SHAP)")
+    if not model:
+        st.warning("Model not loaded — SHAP disabled")
+    else:
+        try:
+            sample_for_shap = df.sample(min(200, len(df)), random_state=42)
+            Xshap = sample_for_shap[[c for c in sample_for_shap.columns if c not in ("id","renewal")]]
+            explainer = shap.Explainer(model.predict_proba if hasattr(model, "predict_proba") else model.predict, Xshap, feature_names=Xshap.columns)
+            shap_values = explainer(Xshap)
+            st.markdown("### SHAP Summary (beeswarm)")
+            plt.figure(figsize=(8,4))
+            shap.plots.beeswarm(shap_values, max_display=12)
+            st.pyplot(plt.gcf())
+            plt.clf()
+        except Exception as e:
+            st.warning(f"SHAP plotting failed: {e}")
+
+# ----- Monitoring tab -----
+with tabs[4]:
+    st.subheader("Monitoring & Logs")
+    st.markdown("Show recent EDA / FE / Training logs, metrics, and dataset snapshots.")
+    if st.button("Show last 200 lines of app.log (if available)"):
+        try:
+            with open("app.log") as f:
+                lines = f.read().splitlines()[-200:]
+                st.text("\n".join(lines))
+        except Exception:
+            st.info("No app.log found in working directory.")
+
+# -----------------------
+# Footer
+# -----------------------
+st.markdown("---")
+st.markdown("Built with ❤️  •  Tips: Use `st.cache_data` for fe/model loads and avoid heavy model training in the UI.")
