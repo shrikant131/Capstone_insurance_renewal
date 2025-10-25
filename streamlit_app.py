@@ -121,18 +121,7 @@ def save_model_metadata(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     print(f"✅ Updated {metadata_path} with entry: {model_key}")
-📘 Example usage (inside training notebook)
-After your Optuna tuning or model evaluation:
 
-python
-Copy code
-best_model = xgb_clf
-best_model_path = "models/xgb_v1.3.joblib"
-joblib.dump(best_model, best_model_path)
-
-best_auc = 0.941
-best_acc = 0.939
-feature_names = X_train.columns.tolist()
 
 save_model_metadata(
     model_key="xgb_v1.3",
