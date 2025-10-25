@@ -8,16 +8,16 @@ import pandas as pd
 import numpy as np
 import joblib
 import io
-import plotly
 import plotly.express as px
 import plotly.graph_objects as go
 import shap
 import base64
-from datetime import datetime
+from datetime import datetime, date
 import json
 from pathlib import Path
 import hashlib
 import matplotlib.pyplot as plt
+import asyncio  # kept in case you call async endpoints
 
 # -----------------------
 # Helper functions (must be defined before use)
@@ -64,77 +64,6 @@ def to_download_link(df: pd.DataFrame, filename="predictions.csv"):
     csv = df.to_csv(index=False)
     b64 = base64.b64encode(csv.encode()).decode()
     return f"data:file/csv;base64,{b64}", filename
-
-def dataset_fingerprint(df):
-    """Same logic used in Streamlit app"""
-    cols = ",".join(sorted(df.columns.astype(str)))
-    meta = f"{cols}|rows={len(df)}"
-    return hashlib.sha1(meta.encode("utf-8")).hexdigest()[:12]
-
-def save_model_metadata(
-    model_key: str,
-    model_path: str,
-    model_name: str,
-    version: str,
-    auc: float,
-    accuracy: float,
-    description: str,
-    feature_names: list,
-    df_eval=None,
-    per_dataset_metrics: dict=None,
-    metadata_path="models/model_metadata.json"
-):
-    """
-    Create or update model metadata JSON automatically after training.
-    """
-    path = Path(metadata_path)
-    if path.exists():
-        with open(path, "r") as f:
-            metadata = json.load(f)
-    else:
-        metadata = {}
-
-    # Build per-dataset fingerprint entry if df_eval given
-    per_dataset = {}
-    if df_eval is not None:
-        fp = dataset_fingerprint(df_eval)
-        per_dataset[fp] = {
-            "auc": round(auc, 3),
-            "accuracy": round(accuracy, 3),
-            "notes": "auto-logged from training dataset"
-        }
-
-    # Compose metadata record
-    metadata[model_key] = {
-        "model_name": model_name,
-        "model_version": version,
-        "trained_on": str(date.today()),
-        "auc": round(auc, 3),
-        "accuracy": round(accuracy, 3),
-        "description": description,
-        "path": model_path,
-        "feature_names": feature_names,
-        "per_dataset": per_dataset or per_dataset_metrics or {}
-    }
-
-    # Save back to file
-    Path(metadata_path).parent.mkdir(exist_ok=True, parents=True)
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"✅ Updated {metadata_path} with entry: {model_key}")
-
-
-save_model_metadata(
-    model_key="xgb_v1.3",
-    model_path=best_model_path,
-    model_name="XGBoost Classifier",
-    version="v1.3",
-    auc=best_auc,
-    accuracy=best_acc,
-    description="Best model selected from Optuna tuning across 5 candidates.",
-    feature_names=feature_names,
-    df_eval=X_valid  # optional; used to record dataset fingerprint
-)
 
 # -----------------------
 # Model metadata utilities
@@ -206,6 +135,50 @@ def render_model_card(meta):
         """,
         unsafe_allow_html=True,
     )
+
+# -----------------------
+# Robust endpoint result handler
+# -----------------------
+def handle_endpoint_result(result, kind="generic", streamlit_prefix=""):
+    """
+    Safely handle responses returned from asyncio.run(...) calling your FastAPI endpoints.
+    Accepts either dict or object (e.g. pydantic model). Returns a normalized dict.
+    - kind: "train" or "predict" or "generic" (used only for controlling displayed fields)
+    - streamlit_prefix: optional prefix for messages
+    """
+    out = {"raw": result}
+    if isinstance(result, dict):
+        # training result conventions
+        if kind == "train":
+            out["error"] = result.get("error")
+            out["chosen_model"] = result.get("chosen_model") or result.get("selected_model") or result.get("model")
+            out["metrics"] = result.get("metrics") or result.get("evaluation") or result.get("metrics_summary")
+        elif kind == "predict":
+            out["error"] = result.get("error")
+            out["prediction"] = result.get("prediction") or result.get("pred") or result.get("label")
+            out["probability"] = result.get("probability") or result.get("prob") or result.get("score")
+        else:
+            # generic mapping
+            out.update(result)
+        return out
+    else:
+        # object-like (pydantic) response
+        try:
+            if kind == "train":
+                out["error"] = getattr(result, "error", None)
+                out["chosen_model"] = getattr(result, "chosen_model", None) or getattr(result, "selected_model", None) or getattr(result, "model", None)
+                out["metrics"] = getattr(result, "metrics", None) or getattr(result, "evaluation", None)
+            elif kind == "predict":
+                out["error"] = getattr(result, "error", None)
+                out["prediction"] = getattr(result, "prediction", None) or getattr(result, "pred", None) or getattr(result, "label", None)
+                out["probability"] = getattr(result, "probability", None) or getattr(result, "prob", None) or getattr(result, "score", None)
+            else:
+                # try to convert object's __dict__ if present
+                if hasattr(result, "__dict__"):
+                    out.update(result.__dict__)
+        except Exception as e:
+            out["error"] = f"Failed to parse response object: {e}"
+        return out
 
 # -----------------------
 # Page config & styling
@@ -464,3 +437,30 @@ with tabs[4]:
 # -----------------------
 st.markdown("---")
 st.markdown("Built with ❤️  •  Tips: Use `st.cache_data` for fe/model loads and avoid heavy model training in the UI.")
+
+# -----------------------
+# Example usage of the robust endpoint handler (commented)
+# -----------------------
+# If you call async FastAPI endpoints like:
+#   result = asyncio.run(train_endpoint(train_dict))
+# replace direct attribute access with the handler:
+#
+# result = asyncio.run(train_endpoint(train_dict))
+# parsed = handle_endpoint_result(result, kind="train")
+# if parsed.get("error"):
+#     st.error(f"Training failed: {parsed['error']}")
+# else:
+#     st.success("Training finished")
+#     st.write("Chosen model:", parsed.get("chosen_model"))
+#     st.json(parsed.get("metrics"))
+#
+# Similarly for prediction:
+# result = asyncio.run(predict_endpoint(payload))
+# parsed = handle_endpoint_result(result, kind="predict")
+# if parsed.get("error"):
+#     st.error(f"Prediction failed: {parsed['error']}")
+# else:
+#     st.write("Prediction:", parsed.get("prediction"))
+#     st.write("Probability:", parsed.get("probability"))
+#
+# Use the handler where your previous code expected `result.chosen_model` etc. — it will prevent the AttributeError when the endpoint returns a dict.
