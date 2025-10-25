@@ -452,9 +452,6 @@ class MLContext:
             X_tr = self.X_train.fillna(0).values
             X_te = self.X_test.fillna(0).values
 
-        self.logger.info(f"In train_neural_network X_tr columns: {X_tr.shape()}")   
-        self.logger.info(f"In train_neural_network X_te columns: {X_te.shape()}")   
-
         if TENSORFLOW_AVAILABLE:
             try:
                 self.logger.info("Using TensorFlow Keras model.")
