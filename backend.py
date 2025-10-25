@@ -43,7 +43,7 @@ logging.basicConfig(
     ]
 )
 
-logger = logging.getLogger("insrenew")
+logger = logging.getLogger("backend")
 
 app = FastAPI(title="Insurance Renewal ML Backend")
 
