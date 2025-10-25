@@ -1,40 +1,36 @@
-# Core Data Science
-numpy>=1.21.0
-pandas>=1.3.0
-pyarrow>=7.0.0
+# Core ML / data science stack
+pandas>=2.0.0
+numpy>=1.25.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+catboost>=1.2
+joblib>=1.3.0
+optuna>=3.4.0
 
-# Machine Learning
-scikit-learn>=1.0.0
-xgboost>=1.5.0
-lightgbm>=3.3.0
+# Visualization and UI
+matplotlib>=3.7.0
+seaborn>=0.13.0
+plotly>=5.22.0
+streamlit>=1.36.0
 
-# Deep Learning (optional — comment these out on cloud deploys if you don't need them)
-# For Apple Silicon Macs (M1/M2) use tensorflow-macos
-tensorflow-macos>=2.8.0; sys_platform == "darwin" and platform_machine == "arm64"
-# For other platforms:
-tensorflow>=2.8.0; sys_platform != "darwin" or platform_machine != "arm64"
-# PyTorch (optional — large wheel)
-# torch>=1.10.0
+# Explainability
+shap>=0.45.0
 
-# ML Utilities
-imbalanced-learn>=0.8.0
-joblib>=1.1.0
-category_encoders>=2.3.0
-optuna>=2.10.0
-shap>=0.40.0
+# Web APIs (for optional FastAPI backend / remote calls)
+fastapi>=0.111.0
+uvicorn>=0.30.0
+requests>=2.32.0
 
-# Visualization
-matplotlib>=3.4.0
-seaborn>=0.11.0
+# Utility and config
+PyYAML>=6.0.1
+json5>=0.9.25
+tqdm>=4.66.0
 
-# Web Framework / Server (include uvicorn only if you actually need to run FastAPI in-process)
-streamlit>=1.10.0
-fastapi>=0.68.0
-pydantic>=1.8.0
-uvicorn>=0.18.0   # optional but recommended if your code imports uvicorn
+# Optional: add these for model storage / vector indexing (if you use them)
+# pymongo>=4.6.0
+# redis>=5.0.0
 
-# Utilities
-requests>=2.26.0
-
-# Optional Models (comment if installation issues)
-pytorch-tabnet>=3.1.0
+# Optional: Azure / cloud SDKs (commented out until used)
+# azure-storage-blob
+# azure-identity
